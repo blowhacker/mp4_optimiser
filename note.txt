@@ -1,0 +1,2 @@
+use this venv
+source /Users/navinkumar/work/vindaloo/.venv/bin/activate
