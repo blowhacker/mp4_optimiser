@@ -10,13 +10,6 @@ used when appropriate. Unsupported combinations are skipped.
 - Python 3.9 or newer
 - `ffmpeg` and `ffprobe` on `PATH`
 
-## Usage
-
-Activate the project virtual environment, if desired:
-
-```bash
-source /Users/navinkumar/work/vindaloo/.venv/bin/activate
-```
 
 Preview what would be encoded without changing media files. Run history and
 the source lock are still written:
