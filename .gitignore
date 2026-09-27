@@ -1,0 +1,15 @@
+# Python bytecode and test-tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local virtual environments
+.venv/
+venv/
+
+# Runtime artefacts created by the optimiser
+.mp4_optimiser.lock
+.*.__optimising__.*
+
+# macOS Finder metadata
+.DS_Store

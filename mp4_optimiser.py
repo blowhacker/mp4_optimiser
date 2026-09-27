@@ -87,7 +87,7 @@ def human_size(num_bytes):
 def human_duration(seconds):
     try:
         seconds = int(float(seconds))
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return "unknown"
 
     hours, remainder = divmod(seconds, 3600)
