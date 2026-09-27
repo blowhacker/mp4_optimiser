@@ -15,20 +15,11 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 
-VIDEO_EXTENSIONS = {
-    ".mp4",
-    ".mkv",
-    ".wmv",
-}
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".wmv"}
 
-EFFICIENT_VIDEO_CODECS = {
-    "hevc",
-    "h265",
-    "av1",
-    "vp9",
-}
+EFFICIENT_VIDEO_CODECS = {"hevc", "h265", "av1", "vp9"}
 
-MIN_SOURCE_SIZE = 100 * 1024 * 1024  # 100 MiB
+MIN_SOURCE_SIZE = 50 * 1024 * 1024  # 50 MiB
 
 CRF = 24
 PRESET = "medium"
@@ -50,19 +41,10 @@ BITRATE_THRESHOLDS = [
 ]
 
 # Audio codecs that are sensible to copy directly into MP4.
-MP4_AUDIO_CODECS = {
-    "aac",
-    "mp3",
-    "ac3",
-    "eac3",
-    "alac",
-}
+MP4_AUDIO_CODECS = {"aac", "mp3", "ac3", "eac3", "alac"}
 
 # Native MP4 subtitle types we are happy to copy unchanged.
-MP4_SUBTITLE_CODECS = {
-    "mov_text",
-    "tx3g",
-}
+MP4_SUBTITLE_CODECS = {"mov_text", "tx3g"}
 
 
 # ---------------------------------------------------------------------------
