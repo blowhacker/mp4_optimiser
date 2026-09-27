@@ -1109,7 +1109,7 @@ def main():
         type=Path,
         help=(
             "SQLite database for run history and cached low-saving rejections "
-            "(default: .mp4_optimiser.sqlite in the source root)."
+            "(default: mp4_optimiser.sqlite beside this script)."
         ),
     )
 
@@ -1146,7 +1146,7 @@ def main():
     state_db_path = (
         args.state_db.resolve()
         if args.state_db is not None
-        else source_root / ".mp4_optimiser.sqlite"
+        else Path(__file__).resolve().with_name("mp4_optimiser.sqlite")
     )
 
     logging.basicConfig(

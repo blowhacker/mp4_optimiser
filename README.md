@@ -38,7 +38,8 @@ different location with `--summary-log /path/to/summary.csv`.
 
 ## State and run history
 
-The optimiser creates `.mp4_optimiser.sqlite` in the source root. It records
+The optimiser creates `mp4_optimiser.sqlite` beside `mp4_optimiser.py`,
+independently of the source library and current working directory. It records
 each run (parameters, start/finish times, runtime, counts, and bytes saved) and
 each file decision. In particular, a file whose completed encode saves less
 than the minimum threshold is cached, so an unchanged file is not encoded again
@@ -48,6 +49,10 @@ The cache is automatically invalidated when the source file changes or the
 encoding policy changes (such as CRF, preset, or minimum saving). Use a custom
 database location with `--state-db /path/to/state.sqlite`; use `--force` to
 retry cached low-saving rejections for one run.
+
+Existing databases in source directories are not moved automatically. To retain
+that history, move the database beside the script while no optimiser is running,
+or select its existing location with `--state-db`.
 
 File identity uses size, modification/change times, device and inode, not a
 content hash. The policy also includes `ffmpeg -version` output. Existing

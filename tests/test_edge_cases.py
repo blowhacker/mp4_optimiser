@@ -107,13 +107,17 @@ class EdgeCaseTests(unittest.TestCase):
         self.assertIsNone(store.cached_rejection(self.source, m.source_fingerprint(self.source), store.signature))
 
     def test_interruption_is_recorded_with_started_attempt(self):
+        script_dir = self.root / 'scripts'
+        script_dir.mkdir()
         with mock.patch.object(sys, 'argv', ['optimiser', str(self.root), '--replace-originals']), \
+             mock.patch.object(m, '__file__', str(script_dir / 'mp4_optimiser.py')), \
              mock.patch.object(m, 'require_binary'), \
              mock.patch.object(m, 'run_capture', return_value=mock.Mock(stdout='test encoder')), \
              mock.patch.object(m, 'process_file', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 m.main()
-        with closing(sqlite3.connect(self.root / '.mp4_optimiser.sqlite')) as connection:
+        self.assertFalse((self.root / 'mp4_optimiser.sqlite').exists())
+        with closing(sqlite3.connect(script_dir / 'mp4_optimiser.sqlite')) as connection:
             self.assertEqual(connection.execute('SELECT status FROM runs').fetchone()[0], 'interrupted')
             outcomes = connection.execute('SELECT outcome FROM attempts ORDER BY id').fetchall()
             self.assertEqual(outcomes, [('started',), ('interrupted',)])
