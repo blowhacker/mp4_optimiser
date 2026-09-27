@@ -6,11 +6,15 @@ import csv
 import fcntl
 import json
 import logging
+import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+import time
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -47,6 +51,10 @@ MP4_AUDIO_CODECS = {"aac", "mp3", "ac3", "eac3", "alac"}
 
 # Native MP4 subtitle types we are happy to copy unchanged.
 MP4_SUBTITLE_CODECS = {"mov_text", "tx3g"}
+
+# Bump this whenever a code change affects whether a previous rejection is
+# safe to reuse.
+STATE_POLICY_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +136,195 @@ def append_summary_log(log_path, source, final_path, old_size, new_size):
 
 
 # ---------------------------------------------------------------------------
+# Persistent state
+# ---------------------------------------------------------------------------
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def source_fingerprint(path):
+    """A cheap identity for invalidating cached decisions after a file changes."""
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns, "device": stat.st_dev, "inode": stat.st_ino}
+
+
+def policy_signature(encoder_identity=None):
+    """Settings that make a prior low-saving result comparable to this run."""
+    return json.dumps(
+        {
+            "version": STATE_POLICY_VERSION,
+            "codec": "libx265",
+            "crf": CRF,
+            "preset": PRESET,
+            "min_saving": MIN_SAVING,
+            "encoder_identity": encoder_identity,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+class StateStore:
+    """SQLite-backed run history and cache for low-saving encodes."""
+
+    def __init__(self, path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path)
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self._initialise()
+        self.signature = policy_signature()
+
+    def _initialise(self):
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                parameters_json TEXT NOT NULL,
+                source_root TEXT NOT NULL,
+                destination_root TEXT NOT NULL,
+                videos_discovered INTEGER,
+                converted INTEGER,
+                skipped INTEGER,
+                failed INTEGER,
+                bytes_saved INTEGER,
+                runtime_seconds REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS attempts (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                attempted_at TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                source_size INTEGER,
+                source_mtime_ns INTEGER,
+                policy_signature TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                detail TEXT,
+                output_path TEXT,
+                output_size INTEGER,
+                saving_percent REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS attempts_source_index
+            ON attempts(source_path, attempted_at);
+
+            CREATE TABLE IF NOT EXISTS rejection_cache (
+                source_path TEXT PRIMARY KEY,
+                source_size INTEGER NOT NULL,
+                source_mtime_ns INTEGER NOT NULL,
+                policy_signature TEXT NOT NULL,
+                rejected_at TEXT NOT NULL,
+                output_size INTEGER NOT NULL,
+                saving_percent REAL NOT NULL
+            );
+            """
+        )
+        self.connection.commit()
+
+        # Additive migration also works with databases from the first release.
+        for table, column, declaration in (
+            ("runs", "status", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("rejection_cache", "fingerprint_json", "TEXT"),
+        ):
+            columns = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        self.connection.commit()
+
+    def start_run(self, source_root, destination_root, parameters):
+        cursor = self.connection.execute(
+            """
+            INSERT INTO runs (started_at, parameters_json, source_root, destination_root, status)
+            VALUES (?, ?, ?, ?, 'running')
+            """,
+            (utc_now(), json.dumps(parameters, sort_keys=True), str(source_root), str(destination_root)),
+        )
+        self.connection.commit()
+        return cursor.lastrowid
+
+    def finish_run(self, run_id, started_monotonic, videos_discovered, converted, skipped, failed, bytes_saved, status="completed"):
+        self.connection.execute(
+            """
+            UPDATE runs
+            SET finished_at = ?, videos_discovered = ?, converted = ?, skipped = ?,
+                failed = ?, bytes_saved = ?, runtime_seconds = ?, status = ?
+            WHERE id = ?
+            """,
+            (
+                utc_now(), videos_discovered, converted, skipped, failed, bytes_saved,
+                time.monotonic() - started_monotonic, status, run_id,
+            ),
+        )
+        self.connection.commit()
+
+    def cached_rejection(self, source, fingerprint, signature):
+        return self.connection.execute(
+            """
+            SELECT rejected_at, saving_percent FROM rejection_cache
+            WHERE source_path = ? AND source_size = ? AND source_mtime_ns = ?
+              AND policy_signature = ?
+              AND fingerprint_json = ?
+            """,
+            (str(source), fingerprint["size"], fingerprint["mtime_ns"], signature,
+             json.dumps(fingerprint, sort_keys=True)),
+        ).fetchone()
+
+    def record_attempt(self, run_id, source, fingerprint, signature, outcome, detail=None,
+                       output_path=None, output_size=None, saving_percent=None):
+        self.connection.execute(
+            """
+            INSERT INTO attempts (
+                run_id, attempted_at, source_path, source_size, source_mtime_ns,
+                policy_signature, outcome, detail, output_path, output_size, saving_percent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id, utc_now(), str(source), fingerprint["size"], fingerprint["mtime_ns"],
+                signature, outcome, detail, str(output_path) if output_path else None,
+                output_size, saving_percent,
+            ),
+        )
+        self.connection.commit()
+
+    def cache_rejection(self, source, fingerprint, signature, output_size, saving_percent):
+        self.connection.execute(
+            """
+            INSERT INTO rejection_cache (
+                source_path, source_size, source_mtime_ns, policy_signature,
+                rejected_at, output_size, saving_percent, fingerprint_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_path) DO UPDATE SET
+                source_size = excluded.source_size,
+                source_mtime_ns = excluded.source_mtime_ns,
+                policy_signature = excluded.policy_signature,
+                rejected_at = excluded.rejected_at,
+                output_size = excluded.output_size,
+                saving_percent = excluded.saving_percent,
+                fingerprint_json = excluded.fingerprint_json
+            """,
+            (
+                str(source), fingerprint["size"], fingerprint["mtime_ns"], signature,
+                utc_now(), output_size, saving_percent, json.dumps(fingerprint, sort_keys=True),
+            ),
+        )
+        self.connection.commit()
+
+    def close(self):
+        self.connection.close()
+
+    def clear_rejection(self, source):
+        self.connection.execute("DELETE FROM rejection_cache WHERE source_path = ?", (str(source),))
+        self.connection.commit()
+
+
+# ---------------------------------------------------------------------------
 # Locking
 # ---------------------------------------------------------------------------
 
@@ -145,6 +342,7 @@ def acquire_lock(source_root):
             fcntl.LOCK_EX | fcntl.LOCK_NB,
         )
     except BlockingIOError:
+        handle.close()
         log.error("Another optimiser process is already running.")
         sys.exit(2)
 
@@ -249,10 +447,20 @@ def should_encode(info):
     if info["size"] < MIN_SOURCE_SIZE:
         return (
             False,
-            f"under 100 MiB ({human_size(info['size'])})",
+            f"under {human_size(MIN_SOURCE_SIZE)} ({human_size(info['size'])})",
         )
 
     codec = info["codec"]
+
+    if any(s.get("disposition", {}).get("attached_pic") for s in info["video_streams"]):
+        return False, "attached artwork requires explicit video stream selection"
+    if info["data_streams"]:
+        return False, "data streams require an explicit compatible muxing policy"
+    for stream in info["video_streams"][:1]:
+        if stream.get("color_transfer") in {"smpte2084", "arib-std-b67"}:
+            return False, "HDR requires an explicit metadata-preserving encode policy"
+        if stream.get("field_order") not in {None, "unknown", "progressive"}:
+            return False, "interlaced video requires an explicit encode policy"
 
     if codec in EFFICIENT_VIDEO_CODECS:
         return (False, f"already efficient codec: {codec}")
@@ -361,6 +569,9 @@ def discover_videos(source_root, destination_root):
         for filename in files:
             path = root_path / filename
 
+            if ".__optimising__" in filename:
+                continue
+
             if path.suffix.lower() not in VIDEO_EXTENSIONS:
                 continue
 
@@ -465,7 +676,12 @@ def validate_output(source_info, output_info):
     source_duration = source_info["duration"]
     output_duration = output_info["duration"]
 
-    if source_duration and output_duration:
+    if not math.isfinite(output_duration) or output_duration <= 0:
+        errors.append("output duration is missing or invalid")
+    if not math.isfinite(source_duration) or source_duration <= 0:
+        errors.append("source duration is missing or invalid")
+
+    if source_duration > 0 and output_duration > 0:
         tolerance = max(
             2.0,
             source_duration * 0.002,
@@ -477,6 +693,7 @@ def validate_output(source_info, output_info):
             errors.append(f"duration differs by {difference:.2f}s")
 
     comparisons = [
+        ("video streams", len(source_info["video_streams"]), len(output_info["video_streams"])),
         (
             "audio streams",
             len(source_info["audio_streams"]),
@@ -522,7 +739,7 @@ def delete_trickplay(source):
     if not trickplay.exists():
         return
 
-    if not trickplay.is_dir():
+    if trickplay.is_symlink() or not trickplay.is_dir():
         log.warning(
             "Expected trickplay directory but found something else: %s", trickplay
         )
@@ -544,6 +761,7 @@ def install_output(
     temp,
     replace_originals,
 ):
+    warnings = []
     final_path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -562,21 +780,30 @@ def install_output(
             #
             # Install the validated replacement FIRST.
             # Only then remove the source.
-            os.replace(
-                temp,
-                final_path,
-            )
+            # Creating a hard link is atomic and refuses even a dangling symlink
+            # at the destination. The temporary file is on the same filesystem.
+            os.link(temp, final_path)
+            try:
+                temp.unlink()
+            except OSError as error:
+                warnings.append(f"temporary link cleanup failed: {error}")
 
-            source.unlink()
+            try:
+                source.unlink()
+            except OSError as error:
+                warnings.append(f"original retained at {source}: {error}")
 
     else:
         if final_path.exists():
             raise RuntimeError(f"destination already exists: {final_path}")
 
-        os.replace(
-            temp,
-            final_path,
-        )
+        os.link(temp, final_path)
+        try:
+            temp.unlink()
+        except OSError as error:
+            warnings.append(f"temporary link cleanup failed: {error}")
+
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +811,19 @@ def install_output(
 # ---------------------------------------------------------------------------
 
 
-def process_file(
+def process_file(*args, **kwargs):
+    temporary_paths = []
+    try:
+        return _process_file(*args, **kwargs, temporary_paths=temporary_paths)
+    finally:
+        for path in temporary_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.warning("Could not remove temporary output: %s", path)
+
+
+def _process_file(
     source,
     source_root,
     destination_root,
@@ -592,14 +831,28 @@ def process_file(
     dry_run,
     keep_trickplay,
     summary_log,
+    state_store=None,
+    run_id=None,
+    force=False,
+    temporary_paths=None,
 ):
+    fingerprint = source_fingerprint(source)
+    signature = state_store.signature if state_store is not None else policy_signature()
     info = probe(source)
+
+    def record(outcome, detail=None, output_path=None, output_size=None, saving_percent=None):
+        if state_store is not None:
+            state_store.record_attempt(
+                run_id, source, fingerprint, signature, outcome, detail,
+                output_path, output_size, saving_percent,
+            )
 
     if info is None:
         log.warning(
             "SKIP no video stream: %s",
             source,
         )
+        record("skipped_no_video", "no video stream")
         return "skipped", 0
 
     log.info(
@@ -620,9 +873,26 @@ def process_file(
             "SKIP: %s",
             reason,
         )
+        record("skipped_ineligible", reason)
         return "skipped", 0
 
+    if state_store is not None and not force:
+        cached = state_store.cached_rejection(source, fingerprint, signature)
+        if cached is not None:
+            detail = (
+                f"previously rejected at {cached['rejected_at']}: "
+                f"only {cached['saving_percent']:.1f}% smaller"
+            )
+            log.info("SKIP: %s", detail)
+            record("skipped_cached_rejection", detail)
+            return "skipped", 0
+
     container, container_reason = choose_container(info)
+    if container == ".mkv" and any(
+        s.get("codec_name") in MP4_SUBTITLE_CODECS for s in info["subtitle_streams"]
+    ):
+        record("skipped_ineligible", "MP4 text subtitles cannot be copied into the required MKV output")
+        return "skipped", 0
 
     log.info("CANDIDATE: %s", reason)
     log.info(
@@ -640,39 +910,39 @@ def process_file(
 
         final_path = destination_root / relative_output
 
-    if final_path != source and final_path.exists():
+    if final_path != source and os.path.lexists(final_path):
         log.error("COLLISION: target already exists: %s", final_path)
+        record("failed_collision", "destination already exists", final_path)
         return "failed", 0
-
-    temp = make_temp_path(final_path)
-
-    if temp.exists():
-        log.warning(
-            "Removing stale temp file: %s",
-            temp,
-        )
-        temp.unlink()
-
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-
-    enough, free, required = free_space_ok(final_path, info["size"])
-
-    if not enough:
-        log.warning(
-            "SKIP insufficient free space: %s available, %s required",
-            human_size(free),
-            human_size(required),
-        )
-        return "skipped", 0
 
     if dry_run:
         log.info(
             "DRY RUN: would encode to %s",
             final_path,
         )
+        record("dry_run", "would encode", final_path)
         return "dry-run", 0
 
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    enough, free, required = free_space_ok(final_path, info["size"])
+    if not enough:
+        log.warning("SKIP insufficient free space: %s available, %s required",
+                    human_size(free), human_size(required))
+        record("skipped_insufficient_space", "insufficient free space", final_path)
+        return "skipped", 0
+
+    fd, name = tempfile.mkstemp(prefix=f".{final_path.stem}.__optimising__", suffix=container,
+                                dir=final_path.parent)
+    os.close(fd)
+    temp = Path(name)
+    temporary_paths.append(temp)
+
     cmd = build_ffmpeg_command(source, temp, container)
+
+    if state_store is not None:
+        # A fresh attempt supersedes a prior rejection, even if this attempt
+        # fails or is interrupted (and should therefore be retried next run).
+        state_store.clear_rejection(source)
 
     log.info("Encoding -> %s", temp)
 
@@ -688,11 +958,13 @@ def process_file(
         raise RuntimeError("ffmpeg reported success but output does not exist")
 
     new_size = temp.stat().st_size
-    old_size = source.stat().st_size
+    if source_fingerprint(source) != fingerprint:
+        raise RuntimeError("source changed during encoding; refusing to install or cache output")
+    old_size = fingerprint["size"]
 
     saving = 1 - (new_size / old_size)
 
-    if saving < MIN_SAVING:
+    if new_size > old_size * (1 - MIN_SAVING):
         log.info(
             "REJECTED: only %.1f%% smaller (%s -> %s)",
             saving * 100,
@@ -701,6 +973,19 @@ def process_file(
         )
 
         temp.unlink()
+
+        saving_percent = saving * 100
+        if state_store is not None:
+            state_store.cache_rejection(
+                source, fingerprint, signature, new_size, saving_percent
+            )
+        record(
+            "rejected_low_saving",
+            f"only {saving_percent:.1f}% smaller",
+            final_path,
+            new_size,
+            saving_percent,
+        )
 
         return "skipped", 0
 
@@ -715,6 +1000,8 @@ def process_file(
 
         temp.unlink()
 
+        record("failed_validation", "; ".join(errors), final_path, new_size, saving * 100)
+
         return "failed", 0
 
     log.info(
@@ -727,37 +1014,41 @@ def process_file(
     # Preserve modification/access times before installation.
     source_stat = source.stat()
 
-    install_output(
+    if source_fingerprint(source) != fingerprint:
+        raise RuntimeError("source changed during validation; refusing replacement")
+    os.chmod(temp, source_stat.st_mode & 0o777)
+    os.utime(temp, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+    warnings = install_output(
         source,
         final_path,
         temp,
         replace_originals,
     )
 
-    os.utime(
-        final_path,
-        ns=(
-            source_stat.st_atime_ns,
-            source_stat.st_mtime_ns,
-        ),
-    )
-
-    if replace_originals and not keep_trickplay:
-        delete_trickplay(source)
-
     saved = old_size - new_size
-
-    append_summary_log(
-        summary_log,
-        source.relative_to(source_root),
-        final_path.relative_to(destination_root),
-        old_size,
-        new_size,
-    )
+    try:
+        if state_store is not None:
+            state_store.clear_rejection(source)
+        record("converted", None, final_path, new_size, saving * 100)
+    except sqlite3.Error as error:
+        warnings.append(f"state recording failed: {error}")
+    try:
+        append_summary_log(summary_log, source.relative_to(source_root),
+                           final_path.relative_to(destination_root), old_size, new_size)
+    except OSError as error:
+        warnings.append(f"CSV reporting failed: {error}")
+    if replace_originals and not keep_trickplay and not warnings:
+        try:
+            delete_trickplay(source)
+        except OSError as error:
+            warnings.append(f"trickplay cleanup failed: {error}")
+    for warning in warnings:
+        log.warning("Output installed at %s; %s", final_path, warning)
 
     log.info("DONE: %s", final_path)
 
-    return "converted", saved
+    return "converted_with_warnings" if warnings else "converted", saved
 
 
 # ---------------------------------------------------------------------------
@@ -813,12 +1104,29 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--state-db",
+        type=Path,
+        help=(
+            "SQLite database for run history and cached low-saving rejections "
+            "(default: .mp4_optimiser.sqlite in the source root)."
+        ),
+    )
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-encode files previously rejected for insufficient space saving.",
+    )
+
     args = parser.parse_args()
 
     require_binary("ffmpeg")
     require_binary("ffprobe")
 
     source_root = args.source.resolve()
+    if not source_root.is_dir():
+        parser.error("source must be an existing directory")
 
     if args.replace_originals:
         destination_root = source_root
@@ -826,12 +1134,19 @@ def main():
         if args.destination is None:
             parser.error("destination is required unless --replace-originals is used")
         destination_root = args.destination.resolve()
-        destination_root.mkdir(parents=True, exist_ok=True)
+        if destination_root == source_root or is_relative_to(source_root, destination_root):
+            parser.error("destination must not equal or contain the source root")
 
     summary_log = (
         args.summary_log.resolve()
         if args.summary_log is not None
         else Path(__file__).resolve().with_name("mp4_optimiser_summary.csv")
+    )
+
+    state_db_path = (
+        args.state_db.resolve()
+        if args.state_db is not None
+        else source_root / ".mp4_optimiser.sqlite"
     )
 
     logging.basicConfig(
@@ -840,66 +1155,124 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    encoder_identity = run_capture(["ffmpeg", "-version"]).stdout
+
     # Keep this handle alive for the entire process.
     lock_handle = acquire_lock(source_root)
 
-    videos = discover_videos(source_root, destination_root)
+    state_store = StateStore(state_db_path)
+    state_store.signature = policy_signature(encoder_identity)
+    run_started_monotonic = time.monotonic()
+    run_id = state_store.start_run(
+        source_root,
+        destination_root,
+        {
+            "dry_run": args.dry_run,
+            "replace_originals": args.replace_originals,
+            "keep_trickplay": args.keep_trickplay,
+            "force": args.force,
+            "policy": json.loads(state_store.signature),
+            "summary_log": str(summary_log),
+            "state_db": str(state_db_path),
+            "min_source_size": MIN_SOURCE_SIZE,
+            "bitrate_thresholds": BITRATE_THRESHOLDS,
+        },
+    )
+
+    videos = []
 
     log.info("Source: %s", source_root)
     log.info("Destination: %s", destination_root)
-    log.info("Videos discovered: %d", len(videos))
     log.info("HEVC settings: CRF %d, preset %s", CRF, PRESET)
     log.info("Minimum source size: %s", human_size(MIN_SOURCE_SIZE))
     log.info("Minimum saving: %.0f%%", MIN_SAVING * 100)
     log.info("Replace originals: %s", args.replace_originals)
     log.info("Summary log: %s", summary_log)
+    log.info("State database: %s", state_db_path)
+    log.info("Force cached rejections: %s", args.force)
 
     converted = 0
     skipped = 0
     failed = 0
     bytes_saved = 0
+    run_status = "failed"
 
-    for index, source in enumerate(
-        videos,
-        start=1,
-    ):
-        log.info("=" * 72)
+    try:
+        videos = discover_videos(source_root, destination_root)
+        log.info("Videos discovered: %d", len(videos))
+        for index, source in enumerate(
+            videos,
+            start=1,
+        ):
+            log.info("=" * 72)
 
-        log.info(
-            "[%d/%d] %s",
-            index,
-            len(videos),
-            source,
-        )
-
-        try:
-            status, saved = process_file(
-                source=source,
-                source_root=source_root,
-                destination_root=destination_root,
-                replace_originals=(args.replace_originals),
-                dry_run=args.dry_run,
-                keep_trickplay=(args.keep_trickplay),
-                summary_log=summary_log,
+            log.info(
+                "[%d/%d] %s",
+                index,
+                len(videos),
+                source,
             )
 
-            if status == "converted":
-                converted += 1
-                bytes_saved += saved
+            fingerprint = {"size": None, "mtime_ns": None}
+            try:
+                fingerprint = source_fingerprint(source)
+                state_store.record_attempt(run_id, source, fingerprint, state_store.signature, "started")
+                status, saved = process_file(
+                    source=source,
+                    source_root=source_root,
+                    destination_root=destination_root,
+                    replace_originals=(args.replace_originals),
+                    dry_run=args.dry_run,
+                    keep_trickplay=(args.keep_trickplay),
+                    summary_log=summary_log,
+                    state_store=state_store,
+                    run_id=run_id,
+                    force=args.force,
+                )
 
-            elif status in {"skipped", "dry-run"}:
-                skipped += 1
+                if status in {"converted", "converted_with_warnings"}:
+                    converted += 1
+                    bytes_saved += saved
+                    if status == "converted_with_warnings":
+                        failed += 1
 
-            else:
+                elif status in {"skipped", "dry-run"}:
+                    skipped += 1
+
+                else:
+                    failed += 1
+
+            except KeyboardInterrupt:
+                log.warning("Interrupted.")
+                state_store.record_attempt(run_id, source, fingerprint, state_store.signature, "interrupted")
+                raise
+
+            except sqlite3.Error:
+                # Stop before touching another source when durable state is unavailable.
+                raise
+            except Exception as error:
                 failed += 1
-
-        except KeyboardInterrupt:
-            log.warning("Interrupted.")
-            raise
-
-        except Exception:
-            failed += 1
-            log.exception("FAILED processing %s", source)
+                log.exception("FAILED processing %s", source)
+                try:
+                    state_store.record_attempt(
+                        run_id, source, fingerprint, state_store.signature,
+                        "failed_exception", str(error),
+                    )
+                except OSError:
+                    log.warning("Could not record failed attempt; source no longer exists.")
+        run_status = "completed_with_errors" if failed else "completed"
+    except KeyboardInterrupt:
+        run_status = "interrupted"
+        raise
+    finally:
+        try:
+            state_store.finish_run(
+                run_id, run_started_monotonic, len(videos), converted,
+                skipped, failed, bytes_saved, run_status,
+            )
+        finally:
+            state_store.close()
+            lock_handle.close()
 
     log.info("=" * 72)
     log.info("COMPLETE")
@@ -907,9 +1280,6 @@ def main():
     log.info("Skipped:   %d", skipped)
     log.info("Failed:    %d", failed)
     log.info("Saved:     %s", human_size(bytes_saved))
-
-    # Explicit reference prevents linters deciding this is unused.
-    _ = lock_handle
 
     if failed:
         sys.exit(1)

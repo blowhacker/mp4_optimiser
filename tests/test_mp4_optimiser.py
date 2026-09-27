@@ -2,8 +2,10 @@ import csv
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import mp4_optimiser as optimiser
 
@@ -93,6 +95,94 @@ class SummaryLogTests(unittest.TestCase):
                     "50.0",
                 ],
             )
+
+
+class StateStoreTests(unittest.TestCase):
+    def test_rejection_cache_requires_matching_file_and_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "film.mp4"
+            source.write_bytes(b"original")
+            store = optimiser.StateStore(root / "state.sqlite")
+            fingerprint = optimiser.source_fingerprint(source)
+            signature = optimiser.policy_signature()
+
+            store.cache_rejection(source, fingerprint, signature, 7, 12.5)
+
+            self.assertIsNotNone(
+                store.cached_rejection(source, fingerprint, signature)
+            )
+            self.assertIsNone(
+                store.cached_rejection(source, fingerprint, "different-policy")
+            )
+
+            time.sleep(0.001)
+            source.write_bytes(b"changed source")
+            changed_fingerprint = optimiser.source_fingerprint(source)
+            self.assertIsNone(
+                store.cached_rejection(source, changed_fingerprint, signature)
+            )
+            store.close()
+
+    def test_process_file_skips_cached_rejection_without_encoding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "film.mp4"
+            source.write_bytes(b"source")
+            store = optimiser.StateStore(root / "state.sqlite")
+            fingerprint = optimiser.source_fingerprint(source)
+            signature = optimiser.policy_signature()
+            run_id = store.start_run(root, root, {})
+            store.cache_rejection(source, fingerprint, signature, 5, 10.0)
+
+            with mock.patch.object(optimiser, "probe", return_value=make_info()) as probe:
+                status, saved = optimiser.process_file(
+                    source,
+                    root,
+                    root,
+                    False,
+                    False,
+                    False,
+                    root / "summary.csv",
+                    store,
+                    run_id,
+                )
+
+            self.assertEqual((status, saved), ("skipped", 0))
+            self.assertEqual(probe.call_count, 1)
+            outcome = store.connection.execute(
+                "SELECT outcome FROM attempts WHERE run_id = ?", (run_id,)
+            ).fetchone()["outcome"]
+            self.assertEqual(outcome, "skipped_cached_rejection")
+            store.close()
+
+    def test_runs_and_attempts_capture_completion_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "film.mp4"
+            source.write_bytes(b"source")
+            store = optimiser.StateStore(root / "state.sqlite")
+            run_id = store.start_run(root, root, {"force": False})
+            store.record_attempt(
+                run_id,
+                source,
+                optimiser.source_fingerprint(source),
+                optimiser.policy_signature(),
+                "rejected_low_saving",
+                "only 10.0% smaller",
+                output_size=5,
+                saving_percent=10.0,
+            )
+            store.finish_run(run_id, time.monotonic(), 1, 0, 1, 0, 0)
+
+            run = store.connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            attempt = store.connection.execute("SELECT * FROM attempts WHERE run_id = ?", (run_id,)).fetchone()
+            self.assertIsNotNone(run["finished_at"])
+            self.assertEqual(run["videos_discovered"], 1)
+            self.assertEqual(run["skipped"], 1)
+            self.assertEqual(attempt["outcome"], "rejected_low_saving")
+            self.assertEqual(attempt["saving_percent"], 10.0)
+            store.close()
 
 
 class DecisionTests(unittest.TestCase):
