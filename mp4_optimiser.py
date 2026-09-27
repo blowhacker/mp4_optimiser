@@ -423,10 +423,7 @@ def validate_output(source_info, output_info):
     if output_info is None:
         return ["output contains no video stream"]
 
-    if output_info["codec"] not in {
-        "hevc",
-        "h265",
-    }:
+    if output_info["codec"] not in {"hevc", "h265"}:
         errors.append(f"expected HEVC output, got {output_info['codec']}")
 
     if (
@@ -503,15 +500,11 @@ def delete_trickplay(source):
 
     if not trickplay.is_dir():
         log.warning(
-            "Expected trickplay directory but found something else: %s",
-            trickplay,
+            "Expected trickplay directory but found something else: %s", trickplay
         )
         return
 
-    log.info(
-        "Removing trickplay: %s",
-        trickplay,
-    )
+    log.info("Removing trickplay: %s", trickplay)
 
     shutil.rmtree(trickplay)
 
@@ -606,11 +599,7 @@ def process_file(
 
     container, container_reason = choose_container(info)
 
-    log.info(
-        "CANDIDATE: %s",
-        reason,
-    )
-
+    log.info("CANDIDATE: %s", reason)
     log.info(
         "Container: %s (%s)",
         container,
@@ -627,10 +616,7 @@ def process_file(
         final_path = destination_root / relative_output
 
     if final_path != source and final_path.exists():
-        log.error(
-            "COLLISION: target already exists: %s",
-            final_path,
-        )
+        log.error("COLLISION: target already exists: %s", final_path)
         return "failed", 0
 
     temp = make_temp_path(final_path)
@@ -642,15 +628,9 @@ def process_file(
         )
         temp.unlink()
 
-    final_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    final_path.parent.mkdir(parents=True, exist_ok=True)
 
-    enough, free, required = free_space_ok(
-        final_path,
-        info["size"],
-    )
+    enough, free, required = free_space_ok(final_path, info["size"])
 
     if not enough:
         log.warning(
@@ -667,16 +647,9 @@ def process_file(
         )
         return "dry-run", 0
 
-    cmd = build_ffmpeg_command(
-        source,
-        temp,
-        container,
-    )
+    cmd = build_ffmpeg_command(source, temp, container)
 
-    log.info(
-        "Encoding -> %s",
-        temp,
-    )
+    log.info("Encoding -> %s", temp)
 
     process = subprocess.run(cmd)
 
@@ -710,17 +683,10 @@ def process_file(
 
     output_info = probe(temp)
 
-    errors = validate_output(
-        info,
-        output_info,
-    )
-
+    errors = validate_output(info, output_info)
     if errors:
         for error in errors:
-            log.error(
-                "VALIDATION: %s",
-                error,
-            )
+            log.error("VALIDATION: %s", error)
 
         temp.unlink()
 
@@ -756,10 +722,7 @@ def process_file(
 
     saved = old_size - new_size
 
-    log.info(
-        "DONE: %s",
-        final_path,
-    )
+    log.info("DONE: %s", final_path)
 
     return "converted", saved
 
@@ -821,10 +784,7 @@ def main():
         if args.destination is None:
             parser.error("destination is required unless --replace-originals is used")
         destination_root = args.destination.resolve()
-        destination_root.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        destination_root.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -835,46 +795,15 @@ def main():
     # Keep this handle alive for the entire process.
     lock_handle = acquire_lock(source_root)
 
-    videos = discover_videos(
-        source_root,
-        destination_root,
-    )
+    videos = discover_videos(source_root, destination_root)
 
-    log.info(
-        "Source: %s",
-        source_root,
-    )
-
-    log.info(
-        "Destination: %s",
-        destination_root,
-    )
-
-    log.info(
-        "Videos discovered: %d",
-        len(videos),
-    )
-
-    log.info(
-        "HEVC settings: CRF %d, preset %s",
-        CRF,
-        PRESET,
-    )
-
-    log.info(
-        "Minimum source size: %s",
-        human_size(MIN_SOURCE_SIZE),
-    )
-
-    log.info(
-        "Minimum saving: %.0f%%",
-        MIN_SAVING * 100,
-    )
-
-    log.info(
-        "Replace originals: %s",
-        args.replace_originals,
-    )
+    log.info("Source: %s", source_root)
+    log.info("Destination: %s", destination_root)
+    log.info("Videos discovered: %d", len(videos))
+    log.info("HEVC settings: CRF %d, preset %s", CRF, PRESET)
+    log.info("Minimum source size: %s", human_size(MIN_SOURCE_SIZE))
+    log.info("Minimum saving: %.0f%%", MIN_SAVING * 100)
+    log.info("Replace originals: %s", args.replace_originals)
 
     converted = 0
     skipped = 0
@@ -908,10 +837,7 @@ def main():
                 converted += 1
                 bytes_saved += saved
 
-            elif status in {
-                "skipped",
-                "dry-run",
-            }:
+            elif status in {"skipped", "dry-run"}:
                 skipped += 1
 
             else:
@@ -923,35 +849,14 @@ def main():
 
         except Exception:
             failed += 1
-
-            log.exception(
-                "FAILED processing %s",
-                source,
-            )
+            log.exception("FAILED processing %s", source)
 
     log.info("=" * 72)
-
     log.info("COMPLETE")
-
-    log.info(
-        "Converted: %d",
-        converted,
-    )
-
-    log.info(
-        "Skipped:   %d",
-        skipped,
-    )
-
-    log.info(
-        "Failed:    %d",
-        failed,
-    )
-
-    log.info(
-        "Saved:     %s",
-        human_size(bytes_saved),
-    )
+    log.info("Converted: %d", converted)
+    log.info("Skipped:   %d", skipped)
+    log.info("Failed:    %d", failed)
+    log.info("Saved:     %s", human_size(bytes_saved))
 
     # Explicit reference prevents linters deciding this is unused.
     _ = lock_handle
