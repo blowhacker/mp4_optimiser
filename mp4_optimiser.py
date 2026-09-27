@@ -2,6 +2,7 @@
 # https://gist.github.com/blowhacker/21f5fe02e791871a78a784357452e9fe
 
 import argparse
+import csv
 import fcntl
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -91,6 +93,38 @@ def run_capture(cmd):
 def require_binary(name):
     if shutil.which(name) is None:
         sys.exit(f"Required program not found: {name}")
+
+
+def append_summary_log(log_path, source, final_path, old_size, new_size):
+    """Append one compact record for an installed conversion."""
+    needs_header = not log_path.exists() or log_path.stat().st_size == 0
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with log_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        if needs_header:
+            writer.writerow(
+                [
+                    "time",
+                    "source",
+                    "output",
+                    "original_bytes",
+                    "final_bytes",
+                    "saved_bytes",
+                    "saving_percent",
+                ]
+            )
+        writer.writerow(
+            [
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+                source,
+                final_path,
+                old_size,
+                new_size,
+                old_size - new_size,
+                f"{(1 - new_size / old_size) * 100:.1f}",
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +591,7 @@ def process_file(
     replace_originals,
     dry_run,
     keep_trickplay,
+    summary_log,
 ):
     info = probe(source)
 
@@ -712,6 +747,14 @@ def process_file(
 
     saved = old_size - new_size
 
+    append_summary_log(
+        summary_log,
+        source.relative_to(source_root),
+        final_path.relative_to(destination_root),
+        old_size,
+        new_size,
+    )
+
     log.info("DONE: %s", final_path)
 
     return "converted", saved
@@ -761,6 +804,15 @@ def main():
         help=("Do not remove sibling *.trickplay directories after replacing media."),
     )
 
+    parser.add_argument(
+        "--summary-log",
+        type=Path,
+        help=(
+            "Append successful conversions to this CSV file "
+            "(default: mp4_optimiser_summary.csv beside this script)."
+        ),
+    )
+
     args = parser.parse_args()
 
     require_binary("ffmpeg")
@@ -775,6 +827,12 @@ def main():
             parser.error("destination is required unless --replace-originals is used")
         destination_root = args.destination.resolve()
         destination_root.mkdir(parents=True, exist_ok=True)
+
+    summary_log = (
+        args.summary_log.resolve()
+        if args.summary_log is not None
+        else Path(__file__).resolve().with_name("mp4_optimiser_summary.csv")
+    )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -794,6 +852,7 @@ def main():
     log.info("Minimum source size: %s", human_size(MIN_SOURCE_SIZE))
     log.info("Minimum saving: %.0f%%", MIN_SAVING * 100)
     log.info("Replace originals: %s", args.replace_originals)
+    log.info("Summary log: %s", summary_log)
 
     converted = 0
     skipped = 0
@@ -821,6 +880,7 @@ def main():
                 replace_originals=(args.replace_originals),
                 dry_run=args.dry_run,
                 keep_trickplay=(args.keep_trickplay),
+                summary_log=summary_log,
             )
 
             if status == "converted":

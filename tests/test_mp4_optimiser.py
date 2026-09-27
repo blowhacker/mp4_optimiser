@@ -1,3 +1,4 @@
+import csv
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,65 @@ class HumanReadableTests(unittest.TestCase):
     def test_human_duration_handles_values_and_invalid_input(self):
         self.assertEqual(optimiser.human_duration(3661), "01:01:01")
         self.assertEqual(optimiser.human_duration("not a duration"), "unknown")
+
+
+class SummaryLogTests(unittest.TestCase):
+    def test_append_summary_log_writes_one_header_and_compact_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "summary.csv"
+            optimiser.append_summary_log(
+                log_path,
+                Path("films/original.mp4"),
+                Path("/output/films/original.mkv"),
+                200,
+                150,
+            )
+            optimiser.append_summary_log(
+                log_path,
+                Path("films/second.mp4"),
+                Path("/output/films/second.mp4"),
+                100,
+                50,
+            )
+
+            with log_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(
+                rows[0],
+                [
+                    "time",
+                    "source",
+                    "output",
+                    "original_bytes",
+                    "final_bytes",
+                    "saved_bytes",
+                    "saving_percent",
+                ],
+            )
+            self.assertEqual(
+                rows[1][1:],
+                [
+                    "films/original.mp4",
+                    "/output/films/original.mkv",
+                    "200",
+                    "150",
+                    "50",
+                    "25.0",
+                ],
+            )
+            self.assertEqual(
+                rows[2][1:],
+                [
+                    "films/second.mp4",
+                    "/output/films/second.mp4",
+                    "100",
+                    "50",
+                    "50",
+                    "50.0",
+                ],
+            )
 
 
 class DecisionTests(unittest.TestCase):

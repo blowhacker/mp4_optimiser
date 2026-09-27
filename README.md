@@ -30,6 +30,11 @@ Write validated conversions to a separate destination directory:
 python mp4_optimiser.py /media/library /media/optimised
 ```
 
+Successful conversions are appended as compact CSV rows to
+`mp4_optimiser_summary.csv` beside the script. Each row includes the timestamp,
+source and output filenames, original/final byte sizes, and saving. Set a
+different location with `--summary-log /path/to/summary.csv`.
+
 Replace source files only after a successful encode and validation. This can
 remove sibling `*.trickplay` directories that no longer match the media file:
 
