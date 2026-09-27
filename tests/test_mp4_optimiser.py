@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +104,36 @@ class DiscoveryTests(unittest.TestCase):
                 optimiser.discover_videos(source, destination),
                 [(source / "keep.mp4").resolve()],
             )
+
+
+class LockingTests(unittest.TestCase):
+    def test_rejected_contender_preserves_owner_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            lock_path = source / ".mp4_optimiser.lock"
+            owner = optimiser.acquire_lock(source)
+
+            try:
+                owner_pid = lock_path.read_text()
+                contender = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            "import mp4_optimiser as optimiser; "
+                            f"optimiser.acquire_lock(Path({str(source)!r}))"
+                        ),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(contender.returncode, 2)
+                self.assertEqual(lock_path.read_text(), owner_pid)
+            finally:
+                owner.close()
 
 
 if __name__ == "__main__":

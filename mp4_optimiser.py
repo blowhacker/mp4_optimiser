@@ -119,7 +119,9 @@ def require_binary(name):
 def acquire_lock(source_root):
     lock_path = source_root / ".mp4_optimiser.lock"
 
-    handle = open(lock_path, "w")
+    # Do not truncate the PID recorded by an already-running process before
+    # we know that this process owns the lock.
+    handle = open(lock_path, "a+")
 
     try:
         fcntl.flock(
@@ -130,7 +132,9 @@ def acquire_lock(source_root):
         log.error("Another optimiser process is already running.")
         sys.exit(2)
 
-    handle.write(str(os.getpid()))
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
     handle.flush()
 
     return handle
