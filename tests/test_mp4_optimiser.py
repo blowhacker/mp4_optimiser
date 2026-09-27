@@ -105,6 +105,19 @@ class DiscoveryTests(unittest.TestCase):
                 [(source / "keep.mp4").resolve()],
             )
 
+    def test_discover_videos_does_not_prune_source_when_replacing_originals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            nested = source / "movie"
+            nested.mkdir(parents=True)
+            video = nested / "keep.mkv"
+            video.touch()
+
+            self.assertEqual(
+                optimiser.discover_videos(source, source),
+                [video.resolve()],
+            )
+
 
 class LockingTests(unittest.TestCase):
     def test_rejected_contender_preserves_owner_pid(self):

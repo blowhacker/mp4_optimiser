@@ -291,6 +291,14 @@ def discover_videos(source_root, destination_root):
     source_root = source_root.resolve()
     destination_root = destination_root.resolve()
 
+    # When replacing originals the destination is the source root.  In that
+    # case, every child directory is necessarily below the destination, so
+    # pruning paths below it would prevent os.walk from seeing any media.
+    exclude_destination = (
+        destination_root != source_root
+        and is_relative_to(destination_root, source_root)
+    )
+
     for root, dirs, files in os.walk(
         source_root,
         topdown=True,
@@ -306,9 +314,9 @@ def discover_videos(source_root, destination_root):
             if dirname.endswith(".trickplay"):
                 continue
 
-            if candidate == destination_root or is_relative_to(
-                candidate,
-                destination_root,
+            if exclude_destination and (
+                candidate == destination_root
+                or is_relative_to(candidate, destination_root)
             ):
                 continue
 
